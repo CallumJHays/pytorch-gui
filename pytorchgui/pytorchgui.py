@@ -3,8 +3,13 @@ from datetime import datetime
 from torch.autograd import Variable, Function
 from torch.nn import Parameter
 from string import ascii_lowercase
-import inspect
+import numpy as np
 import copy
+from sanic import Sanic
+import sanic.response as response
+from sanic_cors import CORS
+import webbrowser
+import os
 
 
 class Graph:
@@ -12,199 +17,156 @@ class Graph:
     A graph structure used to analyse a pytorch graph for pytorchgui
     """
 
-    def __init__(self, module, inputs):
+    def __init__(self, module, dataloader=None):
         self.module = module
-        self.backward_graph = {}
-        self.input_vars = []
-        self.node_id_map = {}
-        self.id_generator = alphabetical_ids()
+        # dictionary of references to the modules and parameters
+        self.module_tree = {}
+        self.module_to_id = {}
+        self.param_to_id = {}
+        self.functional_graph = {}
+        self.id_gen = alphabetical_ids()
+        self.prev_id = None
+        self.dataloader = dataloader
 
-        self._gen_backward_deps(module(inputs).creator)
+        unique_param_ids = set()
+        for param in module.parameters():
+            param_id = next(self.id_gen)
+            self.prev_id = param_id
+            self.param_to_id[param] = param_id
+            unique_param_ids.add(param_id)
 
-    def _gen_backward_deps(self, node):
-        """
-        Recursively traverses the dependencies for a node and builds up the
-        `Graph.backward_graph` mapping unique layers to their serializable IDs
-        and their dependencies.
+        def register_submodules(module):
+            module_id = next(self.id_gen)
+            self.prev_id = module_id
+            self.module_to_id[module] = module_id
 
-        If any layer is new (hasn't been seen by this PyTorchGraph object
-        during a previous forward pass) then it will be added to both
-        `node_id_map` and `backward_graph`. This is important as for dynamic
-        neural networks, the layers actually being used and activated may not
-        be included in the graph logic itself (if statements, etc...)
-
-        Args:
-            node : any pytorch.nn.autograd node.
-                When being used non-recursively (outside this function),
-                generally applied to the output variable of a module given
-                inputs.
-
-        Returns:
-            The node_id of the node being passed in to the function.
-            If the node doesn't already exist in the graph it will be assigned.
-            This is mostly only useful for recursive purposes.
-        """
-
-        if node not in self.node_id_map:
-            node_id = next(self.id_generator)
-            self.node_id_map[node] = node_id
-
-            self.backward_graph[node_id] = {
-                'id': node_id,
-                'type': type(node),
-                'requires_grad': node.requires_grad,
-                'obj': node
+            self.module_tree[module_id] = {
+                'children': {},
+                'params': {}
             }
 
-            if isinstance(node, Parameter):
-                self.backward_graph[node_id]['data'] = {
-                    'type': type(node.data),
-                    'size': node.data.size()
-                }
+            for key, submodule in module._modules.items():
+                submodule_id = register_submodules(submodule)
+                self.module_tree[module_id]['children'][key] = submodule_id
+                for key, param_id in self.module_tree[submodule_id]['params'].items():
+                    unique_param_ids.remove(param_id)
 
-            elif isinstance(node, Function):
-                self.backward_graph[node_id]['parameters'] = []
-                self.backward_graph[node_id]['dependencies'] = []
+            for key, param in module._parameters.items():
+                param_id = self.param_to_id[param]
+                if param_id in unique_param_ids:
+                    self.module_tree[module_id]['params'][key] = param_id
 
-                for dep, _ in node.previous_functions:
-                    dep_id = self._gen_backward_deps(dep)
-                    if isinstance(dep, Parameter):
-                        self.backward_graph[node_id]['parameters'] \
-                            .append(self.backward_graph[dep_id])
-                    else:
-                        self.backward_graph[node_id]['dependencies'] \
-                            .append(self.backward_graph[dep_id])
+            return module_id
 
-            elif isinstance(node, Variable):
-                self.backward_graph[node_id]['data'] = {
-                    'type': type(node.data),
-                    'size': node.data.size()
+        register_submodules(self.module)
+
+    def instrumented_forward(self, *inputs):
+        self.functional_graph = {}
+        node_to_id = {k: v for k, v in self.param_to_id.items()}
+        activations = {}
+        node_id_gen = alphabetical_ids(self.prev_id)
+
+        # fills the functional graph
+        def fill_functional_graph(node, parent_module):
+            if node not in node_to_id:
+                node_id = next(node_id_gen)
+                node_to_id[node] = node_id
+
+                self.functional_graph[node_id] = {
+                    'type': type(node).__name__,
+                    'dependencies': set(),
+                    'parent_module': self.module_to_id[parent_module]
                 }
 
                 if hasattr(node, 'previous_functions'):
-                    self.backward_graph[node_id]['dependencies'] = []
-                    for dep, i in node.previous_functions:
-                        dep_id = self._gen_backward_deps(dep)
-                        self.backward_graph[node_id]['dependencies'] \
-                            .append(self.backward_graph[dep_id])
-                else:
-                    if not node.requires_grad:
-                        self.input_vars.append(node_id)
+                    for dep, _ in node.previous_functions:
+                        if dep not in self.functional_graph:
+                            fill_functional_graph(dep, parent_module)
+                        self.functional_graph[node_id]['dependencies'].add(
+                            node_to_id[dep])
 
-            else:
+        def forward_hook(module, inputs, output):
+            activations[self.module_to_id[module]] = {
+                'inputs': tuple(np.squeeze(input.data.numpy()) for input in inputs),
+                'output': np.squeeze(output.data.numpy())
+            }
+
+            for dep, _ in output.creator.previous_functions:
+                fill_functional_graph(dep, module)
+
+        if not any(inputs):
+            if self.dataloader is None:
                 raise Exception(
-                    "node type unaccounted for!: " + type(node).__name__)
-        else:
-            node_id = self.node_id_map[node]
+                    "Either inputs or a dataloader must be provided")
+            inputs, targets = next(self.dataloader.__iter__())
+            if isinstance(inputs, tuple):
+                inputs = tuple(Variable(input.data.view(
+                    [1] + list(input.data.size()))) for input in inputs)
+            else:
+                inputs = tuple(
+                    Variable(inputs.view([1] + list(inputs.size()))))
 
-        return node_id
+        for input in inputs:
+            input_id = next(node_id_gen)
+            node_to_id[input] = input_id
+            self.functional_graph[input_id] = {
+                'type': 'Input:' + type(input.data).__name__,
+                'dependencies': set(),
+                'parent_module': None
+            }
 
-    def serialize(self):
-        """
-        Serializes the structure of the backward graph into a JSON format.
-        This JSON addresses each node by a hash, providing its type, an object
-        of its parameters, and its dependant nodes.
+        handles = [module.register_forward_hook(
+            forward_hook) for module in self.module_to_id]
 
-        Returns:
-            A Json serialized version of this graph
-        """
-        serializable_graph = {
-            'name': self.module.__class__.__name__,
-            'date': str(datetime.now()),
-            'input_vars': self.input_vars,
-            'ops': {},
-            'parameters': {}
+        res = self.module.forward(*inputs)
+
+        forward_hook(self.module, inputs, res)
+
+        # remove the handle to keep the function stateless
+        for handle in handles:
+            handle.remove()
+
+        return {
+            'activations': activations,
+            'functional_graph': self.functional_graph,
+            'result': np.squeeze(res.data.numpy())
         }
 
-        for node_id, node in self.backward_graph.items():
-            dict_key = 'parameters' if node['type'] == Parameter else 'ops'
-
-            serializable_graph[dict_key][node_id] = {}
-
-            node_dict = {}
-
-            node_dict['type'] = node['type'].__name__
-
-            if 'data' in node:
-                node_dict['data'] = {
-                    'type': node['data']['type'].__name__,
-                    'size': node['data']['size']
-                }
-
-            # replace recursive with normalized ID's
-            if 'parameters' in node:
-                node_dict['parameters'] = \
-                    [param['id'] for param in node['parameters']]
-
-            if 'dependencies' in node:
-                node_dict['dependencies'] = \
-                    [dep['id'] for dep in node['dependencies']]
-
-            serializable_graph[dict_key][node_id] = node_dict
-
-        return json.dumps(serializable_graph)
-
-    def instrumented_forward(self, inputs, target_ids='all'):
+    def instrumented_backward(self, inputs, outputs):
         """
-        Completes a forward pass throughout the entire graph for the given
-        input, returning the dict of target_ids mapping to their activations
-        in this forward pass.
-
-        Args:
-            inputs : tuple of input tensor variables
-                Input tensor variable to be used in place of the calculated
-                input node of the graph.
-
-            target_ids : list of node_ids or 'all'
-                List of node_ids corresponding to the nodes of which the
-                instrumented activations are requested. IE passing the id for a
-                linear layer will include the output activation of that linear
-                layer in the response.
-
-        Returns:
-            dict of target_id => activations as a numpy array
+        Runs backwards on the graph, returning the saliency maps
         """
+        pass
 
-        # generate the backward dependencies off this particular input
-        self._gen_backward_deps(self.module(inputs).creator)
+    def serialize(self):
+        serialized = {}
 
-        if target_ids == 'all':
-            target_ids = [node_id for node_id in self.backward_graph]
+        for module, module_id in self.module_to_id.items():
+            module_dict = self.module_tree[module_id]
 
-        activations = {}
+            serialized[module_id] = {
+                'type': 'Module',
+                'subtype': type(module).__name__,
+                'params': copy.copy(module_dict['params']),
+                'children': copy.copy(module_dict['children'])
+            }
 
-        def fill_activations(node_id):
-            if node_id not in activations:
-                node_dict = self.backward_graph[node_id]
-                node = node_dict['obj']
+        for param, param_id in self.param_to_id.items():
+            serialized[param_id] = {
+                'type': 'Parameter',
+                'subtype': type(param.data).__name__,
+                'shape': param.data.size()
+            }
 
-                if isinstance(node, Variable) or isinstance(node, Parameter):
-                    activations[node_id] = node
+        for func_id, func_dict in self.functional_graph.items():
+            serialized[func_id] = {
+                'type': 'Function',
+                'subtype': func_dict['type'],
+                'dependencies': list(copy.copy(func_dict['dependencies'])),
+                'parent_module': func_dict['parent_module']
+            }
 
-                elif isinstance(node, Function):
-                    args = ()
-
-                    if 'dependencies' in node_dict:
-                        for dep in node_dict['dependencies']:
-                            fill_activations(dep['id'])
-                            args += (activations[dep['id']],)
-
-                    if 'parameters' in node_dict:
-                        for param in node_dict['parameters']:
-                            fill_activations(param['id'])
-                            args += (activations[param['id']],)
-
-                    activations[node_id] = node.forward(*args)
-
-            return activations[node_id]
-
-        target_activations = {}
-
-        for target_id in target_ids:
-            fill_activations(target_id)
-            target_activations[target_id] = activations[target_id].data.numpy()
-
-        return target_activations
+        return json.dumps(serialized)
 
     def serve(self, port=7060, url_base="/api/v1"):
         """
@@ -219,26 +181,67 @@ class Graph:
 
             `backprop`: Runs `Graph.instrumented_backward` and serializes the
                 backpropagation values (ie. saliency maps) of the requested
-                `target_ids` as JSON to be viewable by the front-end visualizer.
+                `target_ids` as JSON to be viewable by the front-end visualizer
 
         Args:
             port: The port to run this server on.
             url_base: The base_url for the api endpoints. "/api/v1" by default.
         """
-        # TODO this
-        pass
+        app = Sanic()
 
-    def __repr__(self):
-        return self.module.__repr__()
+        CORS(app)
+
+        @app.route(url_base + "/graph_spec")
+        async def graph_spec(request):
+            return response.text(self.serialize())
+
+        @app.route(url_base + "/instrumented_forward")
+        async def activations(request):
+            forward = self.instrumented_forward()
+            for k in forward['activations']:
+                forward['activations'][k]['inputs'] = \
+                    list(forward['activations'][k]['inputs'])
+                for i, inpt in enumerate(forward['activations'][k]['inputs']):
+                    forward['activations'][k]['inputs'][i] = inpt.tolist()
+                forward['activations'][k]['output'] = \
+                    forward['activations'][k]['output'].tolist()
+
+            forward['result'] = forward['result'].tolist()
+
+            return response.json(forward)
+
+        webbrowser.open("file://" + os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "viewer.html"))
+
+        app.run(host="0.0.0.0", port=port)
 
 
-def alphabetical_ids():
+def alphabetical_ids(prev=''):
     """
     An infinite iterator over alphabetical id strings from 'a' to 'aa' to 'zz'.
     etc...
     """
     for char in ascii_lowercase:
-        yield char
-    for char in ascii_lowercase:
-        for rest in alphabetical_ids():
-            yield char + rest
+        if str_compare(str(prev), str(char)):
+            yield char
+    for rest in alphabetical_ids():
+        for char in ascii_lowercase:
+            res = char + rest
+            if str_compare(str(prev), str(res)):
+                yield res
+
+
+def str_compare(str1, str2):
+    """
+    Compares alphabetical IDs.
+    """
+    str1_val = 0
+    str2_val = 2
+
+    for i, str_char in enumerate(reversed(str1)):
+        str1_val += ord(str_char) * i
+
+    for i, str_char in enumerate(reversed(str2)):
+        str2_val += ord(str_char) * i
+
+    return str1 < str2

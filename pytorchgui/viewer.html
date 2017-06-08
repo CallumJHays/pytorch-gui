@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/vis/4.20.0/vis.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/vis/4.20.0/vis.min.css" />
+    <title>JS Bin</title>
+    <style>
+        #network {
+            width: 100vw;
+            height: 100vh;
+            border: 1px solid lightgray;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="mynetwork"></div>
+    <script>
+        function _toConsumableArray(arr) { if (Array.isArray(arr)) { for (var i = 0, arr2 = Array(arr.length); i < arr.length; i++) { arr2[i] = arr[i]; } return arr2; } else { return Array.from(arr); } }
+
+        vis = window.vis;
+
+        fetch("http://0.0.0.0:7060/api/v1/graph_spec").then(function (res) {
+            return res.json();
+        }).then(function (json) {
+            var data = Object.keys(json).filter(function (key) {
+                return json[key].type == "Parameter" || json[key].type == "Function";
+            }).reduce(function (data, key) {
+                return {
+                    nodes: [].concat(_toConsumableArray(data.nodes), [{
+                        id: key,
+                        group: json[key].type,
+                        label: (json[key].subtype == 'Threshold' ? 'ReLU' : json[key].subtype) + (json[key].type == 'Parameter' ? ' (' + json[key].shape.join(',') + ')' : '')
+                    }]),
+                    edges: json[key].type == 'Parameter' ? data.edges : [].concat(_toConsumableArray(data.edges), _toConsumableArray(json[key].dependencies.map(function (dep) {
+                        return { from: dep, to: key };
+                    })))
+                };
+            }, { nodes: [], edges: [] });
+
+            new vis.Network(document.getElementById('mynetwork'), {
+                nodes: new vis.DataSet(data.nodes),
+                edges: new vis.DataSet(data.edges)
+            }, { autoResize: true, height: '800px' });
+        }).catch(function (e) {
+            return console.error("Something went wrong...", e);
+        });
+    </script>
+</body>
+
+</html>
