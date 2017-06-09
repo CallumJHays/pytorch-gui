@@ -1,7 +1,0 @@
-setup.py
-PytorchGui.egg-info/PKG-INFO
-PytorchGui.egg-info/SOURCES.txt
-PytorchGui.egg-info/dependency_links.txt
-PytorchGui.egg-info/top_level.txt
-pytorchgui/__init__.py
-pytorchgui/pytorchgui.py
