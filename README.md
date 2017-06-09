@@ -5,7 +5,7 @@ Alexnet example:
 
 ![Alexnet Example](./assets/alexnet.png "Alexnet Example")
 
-# installation
+## Installation
 ```bash
 pip install git+https://github.com/CallumJHays/pytorch-gui
 ```
