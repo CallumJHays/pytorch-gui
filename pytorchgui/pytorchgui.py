@@ -67,7 +67,7 @@ class Graph:
 
     def instrumented_forward(self, *inputs):
         self.functional_graph = {}
-        node_to_id = {k: v for k, v in self.param_to_id.items()}
+        node_to_id = {**self.param_to_id, **self.module_to_id}
         activations = {}
         node_id_gen = alphabetical_ids(self.prev_id)
 
@@ -96,8 +96,7 @@ class Graph:
                 'output': np.squeeze(output.data.numpy())
             }
 
-            for dep, _ in output.creator.previous_functions:
-                fill_functional_graph(dep, module)
+            fill_functional_graph(output.creator, module)
 
         if not any(inputs):
             if self.dataloader is None:
@@ -115,7 +114,8 @@ class Graph:
             input_id = next(node_id_gen)
             node_to_id[input] = input_id
             self.functional_graph[input_id] = {
-                'type': 'Input:' + type(input.data).__name__,
+                'type': 'Input: ' + type(input.data).__name__ + ' ('
+                + ", ".join(map(str, input.data.size())) + ")",
                 'dependencies': set(),
                 'parent_module': None
             }
@@ -127,6 +127,15 @@ class Graph:
 
         forward_hook(self.module, inputs, res)
 
+        res_id = next(node_id_gen)
+        node_to_id[res] = res_id
+        self.functional_graph[res_id] = {
+            'type': 'Output: ' + type(res.data).__name__ + ' ('
+            + ", ".join(map(str, res.data.size())) + ")",
+            'dependencies': set([node_to_id[res.creator]]),
+            'parent_module': self.module_to_id[self.module]
+        }
+
         # remove the handle to keep the function stateless
         for handle in handles:
             handle.remove()
@@ -136,12 +145,6 @@ class Graph:
             'functional_graph': self.functional_graph,
             'result': np.squeeze(res.data.numpy())
         }
-
-    def instrumented_backward(self, inputs, outputs):
-        """
-        Runs backwards on the graph, returning the saliency maps
-        """
-        pass
 
     def serialize(self):
         serialized = {}
@@ -231,12 +234,11 @@ def start_graph_server(graph, port=7060, url_base="/api/v1"):
     async def activations(request):
         forward = graph.instrumented_forward()
         for k in forward['activations']:
-            forward['activations'][k]['inputs'] = \
-                list(forward['activations'][k]['inputs'])
+            forward['activations'][k]['inputs'] = list(
+                forward['activations'][k]['inputs'])
             for i, inpt in enumerate(forward['activations'][k]['inputs']):
                 forward['activations'][k]['inputs'][i] = inpt.tolist()
-            forward['activations'][k]['output'] = \
-                forward['activations'][k]['output'].tolist()
+            forward['activations'][k]['output'] = forward['activations'][k]['output'].tolist()
 
         forward['result'] = forward['result'].tolist()
 
@@ -251,26 +253,27 @@ def alphabetical_ids(prev=''):
     etc...
     """
     for char in ascii_lowercase:
-        if str_compare(str(prev), str(char)):
+        if str_lessthan(str(prev), str(char)):
             yield char
+
     for rest in alphabetical_ids():
         for char in ascii_lowercase:
-            res = char + rest
-            if str_compare(str(prev), str(res)):
+            res = rest + char
+            if str_lessthan(str(prev), str(res)):
                 yield res
 
 
-def str_compare(str1, str2):
+def str_lessthan(str1, str2):
     """
     Compares alphabetical IDs.
     """
     str1_val = 0
-    str2_val = 2
+    str2_val = 0
 
     for i, str_char in enumerate(reversed(str1)):
-        str1_val += ord(str_char) * i
+        str1_val += (ord(str_char) - ord('a') + 1) * pow(26, i)
 
     for i, str_char in enumerate(reversed(str2)):
-        str2_val += ord(str_char) * i
+        str2_val += (ord(str_char) - ord('a') + 1) * pow(26, i)
 
-    return str1 < str2
+    return str1_val < str2_val
