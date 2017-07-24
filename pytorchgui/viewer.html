@@ -33,7 +33,7 @@
                     nodes: [].concat(_toConsumableArray(data.nodes), [{
                         id: key,
                         group: json[key].type,
-                        label: key + ' - ' + (json[key].subtype == 'Threshold' ? 'ReLU' : json[key].subtype) + (json[key].type == 'Parameter' ? ' (' + json[key].shape.join(', ') + ')' : '')
+                        label: (json[key].subtype == 'Threshold' ? 'ReLU' : json[key].subtype) + (json[key].type == 'Parameter' ? ' (' + json[key].shape.join(', ') + ')' : '')
                     }]),
                     edges: json[key].type == 'Parameter' ? data.edges : [].concat(_toConsumableArray(data.edges), _toConsumableArray(json[key].dependencies.map(function (dep) {
                         return { from: dep, to: key };

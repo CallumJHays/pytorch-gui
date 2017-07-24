@@ -98,17 +98,15 @@ class Graph:
 
             fill_functional_graph(output.creator, module)
 
-        if not any(inputs):
+        if len(inputs) == 0:
             if self.dataloader is None:
                 raise Exception(
                     "Either inputs or a dataloader must be provided")
             inputs, targets = next(self.dataloader.__iter__())
             if isinstance(inputs, tuple):
-                inputs = tuple(Variable(input.data.view(
-                    [1] + list(input.data.size()))) for input in inputs)
+                inputs = tuple(Variable(input) for input in inputs)
             else:
-                inputs = tuple(
-                    Variable(inputs.view([1] + list(inputs.size()))))
+                inputs = tuple([Variable(inputs)])
 
         for input in inputs:
             input_id = next(node_id_gen)
